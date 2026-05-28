@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+best_model.pt
+best_residual_mlp.pt
+model_best_mlp.npz
+
+submit.csv
+submit_*.csv
+training_history.csv
+validation_summary.csv
+
