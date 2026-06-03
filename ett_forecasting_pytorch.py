@@ -13,8 +13,8 @@ from torch.utils.data import DataLoader, Dataset
 
 SEED = 42
 DATA_PATH = "ETTh1.csv"
-SAMPLE_PATH = "sample_submit.csv"
-OUTPUT_PATH = "submit.csv"
+SAMPLE_PATH = "csvFiles/sample_submit.csv"
+OUTPUT_PATH = "csvFiles/submit.csv"
 BEST_MODEL_PATH = "best_model.pt"
 RESIDUAL_MODEL_PATH = "best_seq_residual_booster.pt"
 PROJECT_DIR = Path("/content/drive/MyDrive/2026_DeepSyS")
@@ -49,6 +49,7 @@ SEQ_HIDDEN_SIZE = 128
 SEQ_NUM_LAYERS = 2
 SEQ_DROPOUT = 0.2
 AUX_HIDDEN_SIZE = 128
+SEQ_ERROR_LAGS = (96, 168, 336)
 PRETRAIN_EPOCHS = 20
 FINETUNE_EPOCHS = 60
 RESIDUAL_BACKTEST_EPOCHS = 40
@@ -916,6 +917,27 @@ def _residual_stats(residual: np.ndarray) -> np.ndarray:
     )
 
 
+def build_past_baseline_error_features(
+    raw_ot: np.ndarray,
+    baseline_predictor: dict,
+    target_indices: np.ndarray,
+    ot_std: float,
+) -> np.ndarray:
+    target_indices = np.asarray(target_indices, dtype=np.int64)
+    features = []
+    for lag in SEQ_ERROR_LAGS:
+        past_targets = target_indices - lag
+        assert np.all(past_targets >= 0)
+        assert np.all(past_targets + HORIZON <= target_indices)
+
+        past_true = make_true(raw_ot, past_targets)
+        past_baseline = baseline_prediction(raw_ot, past_targets, baseline_predictor)
+        past_error_scaled = ((past_true - past_baseline) / ot_std).astype("float32")
+        past_error_stats = np.stack([_residual_stats(row) for row in past_error_scaled]).astype("float32")
+        features.extend([past_error_scaled, past_error_stats])
+    return np.concatenate(features, axis=1).astype("float32")
+
+
 def build_seq_residual_arrays(
     data: dict,
     baseline_predictor: dict,
@@ -931,6 +953,7 @@ def build_seq_residual_arrays(
 
     baseline_raw = baseline_prediction(raw_ot, target_indices, baseline_predictor).astype("float32")
     baseline_scaled = ((baseline_raw - ot_mean) / ot_std).astype("float32")
+    past_baseline_error_features = build_past_baseline_error_features(raw_ot, baseline_predictor, target_indices, ot_std)
 
     assert np.all(target_indices - SEQ_LOOKBACK >= 0)
     assert np.all(target_indices + HORIZON <= len(values))
@@ -958,6 +981,7 @@ def build_seq_residual_arrays(
                     future_time,
                     raw_stats,
                     seasonal_residual_stats,
+                    past_baseline_error_features[row_idx],
                 ]
             )
         )
@@ -1154,12 +1178,30 @@ def train_seq_residual_booster(
     best_mse = best_metric["mse"]
     best_lambda = best_metric["lambda"]
     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    history = [{"epoch": 0, "phase": "init", "train_loss": np.nan, **{k: best_metric[k] for k in ["mse", "rmse", "mae"]}, "lambda": best_lambda}]
+    best_training_plan = {"pretrain_epochs": 0, "finetune_epochs": 0}
+    history = [
+        {
+            "epoch": 0,
+            "phase": "init",
+            "phase_epoch": 0,
+            "train_loss": np.nan,
+            **{k: best_metric[k] for k in ["mse", "rmse", "mae"]},
+            "lambda": best_lambda,
+        }
+    ]
     print(f"{label} lambda validation")
     print(lambda_df)
     print(f"[{label} 000] val_mse={best_mse:.5f} lambda={best_lambda:.2f} target_met={best_mse < MSE_TARGET}")
     if save_path is not None:
-        torch.save({"model_state": best_state, "best_mse": best_mse, "lambda": best_lambda}, save_path)
+        torch.save(
+            {
+                "model_state": best_state,
+                "best_mse": best_mse,
+                "lambda": best_lambda,
+                "training_plan": best_training_plan,
+            },
+            save_path,
+        )
 
     global_epoch = 0
     for phase, loader, phase_epochs in [
@@ -1196,6 +1238,7 @@ def train_seq_residual_booster(
                 {
                     "epoch": global_epoch,
                     "phase": phase,
+                    "phase_epoch": phase_epoch,
                     "train_loss": train_loss,
                     **{k: epoch_metric[k] for k in ["mse", "rmse", "mae"]},
                     "lambda": epoch_metric["lambda"],
@@ -1213,8 +1256,20 @@ def train_seq_residual_booster(
                 best_lambda = epoch_metric["lambda"]
                 best_metric = epoch_metric
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_training_plan = {
+                    "pretrain_epochs": phase_epoch if phase == "pretrain" else pretrain_epochs,
+                    "finetune_epochs": phase_epoch if phase == "finetune" else 0,
+                }
                 if save_path is not None:
-                    torch.save({"model_state": best_state, "best_mse": best_mse, "lambda": best_lambda}, save_path)
+                    torch.save(
+                        {
+                            "model_state": best_state,
+                            "best_mse": best_mse,
+                            "lambda": best_lambda,
+                            "training_plan": best_training_plan,
+                        },
+                        save_path,
+                    )
                 bad_epochs = 0
             else:
                 bad_epochs += 1
@@ -1237,7 +1292,66 @@ def train_seq_residual_booster(
     print(final_lambda_df)
     if final_metric["mse"] >= MSE_TARGET:
         print(f"{label} warning: validation MSE target not met ({final_metric['mse']:.5f} >= {MSE_TARGET}); baseline fallback can still be selected.")
-    return model, pd.DataFrame(history), {"metric": final_metric, "lambda": final_metric["lambda"], "lambda_df": final_lambda_df}
+    print(f"{label} selected training plan:", best_training_plan)
+    return model, pd.DataFrame(history), {
+        "metric": final_metric,
+        "lambda": final_metric["lambda"],
+        "lambda_df": final_lambda_df,
+        "training_plan": best_training_plan,
+    }
+
+
+def fit_seq_residual_booster_refit(
+    data: dict,
+    baseline_predictor: dict,
+    device: torch.device,
+    training_plan: dict,
+    label: str,
+) -> tuple[nn.Module, pd.DataFrame]:
+    pretrain_seq_x, pretrain_aux_x, pretrain_residual, _ = build_seq_residual_arrays(data, baseline_predictor, data["pretrain_targets"])
+    train_seq_x, train_aux_x, train_residual, _ = build_seq_residual_arrays(data, baseline_predictor, data["seq_train_targets"])
+    pretrain_loader = DataLoader(
+        SeqResidualDataset(pretrain_seq_x, pretrain_aux_x, pretrain_residual),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+    )
+    train_loader = DataLoader(
+        SeqResidualDataset(train_seq_x, train_aux_x, train_residual),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+    )
+
+    set_seed()
+    model = SeqResidualBooster(seq_input_dim=train_seq_x.shape[-1], aux_input_dim=train_aux_x.shape[-1]).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    criterion = nn.MSELoss()
+    scaler = make_grad_scaler(device)
+    amp_enabled = device.type == "cuda"
+    history = []
+
+    print(f"{label} pretrain seq/aux/y:", pretrain_seq_x.shape, pretrain_aux_x.shape, pretrain_residual.shape)
+    print(f"{label} finetune seq/aux/y:", train_seq_x.shape, train_aux_x.shape, train_residual.shape)
+    print(f"{label} training plan:", training_plan)
+    for phase, loader, phase_epochs in [
+        ("refit-pretrain", pretrain_loader, int(training_plan["pretrain_epochs"])),
+        ("refit-finetune", train_loader, int(training_plan["finetune_epochs"])),
+    ]:
+        for phase_epoch in range(1, phase_epochs + 1):
+            train_loss = train_seq_residual_epoch(
+                model,
+                loader,
+                optimizer,
+                criterion,
+                scaler,
+                device,
+                amp_enabled,
+                label,
+                phase,
+                phase_epoch,
+            )
+            history.append({"phase": phase, "phase_epoch": phase_epoch, "train_loss": train_loss})
+
+    return model, pd.DataFrame(history, columns=["phase", "phase_epoch", "train_loss"])
 
 
 @torch.no_grad()
@@ -1498,9 +1612,30 @@ def rolling_residual_backtest(data: dict, device: torch.device) -> pd.DataFrame:
         )
 
         baseline_outer = evaluate_baseline_on_targets(fold_data, fold_baseline, outer_targets)
-        residual_outer = evaluate_seq_residual_booster_on_targets(
+        validation_stage_outer = evaluate_seq_residual_booster_on_targets(
             model,
             fold_data,
+            fold_baseline,
+            residual_info["lambda"],
+            outer_targets,
+            device,
+        )
+        refit_data = make_data_view(
+            data,
+            outer_start,
+            midnight_target_indices(df, LOOKBACK, outer_start),
+            outer_targets,
+        )
+        refit_model, _ = fit_seq_residual_booster_refit(
+            refit_data,
+            fold_baseline,
+            device,
+            residual_info["training_plan"],
+            label=f"SeqResidualBT{fold_idx}Refit",
+        )
+        residual_outer = evaluate_seq_residual_booster_on_targets(
+            refit_model,
+            refit_data,
             fold_baseline,
             residual_info["lambda"],
             outer_targets,
@@ -1517,7 +1652,10 @@ def rolling_residual_backtest(data: dict, device: torch.device) -> pd.DataFrame:
                 "inner_baseline_mse": fold_baseline["metric"]["mse"],
                 "inner_residual_mse": residual_info["metric"]["mse"],
                 "lambda": residual_info["lambda"],
+                "refit_pretrain_epochs": residual_info["training_plan"]["pretrain_epochs"],
+                "refit_finetune_epochs": residual_info["training_plan"]["finetune_epochs"],
                 "outer_baseline_mse": baseline_outer["mse"],
+                "outer_validation_stage_residual_mse": validation_stage_outer["mse"],
                 "outer_residual_mse": residual_outer["mse"],
                 "outer_selected_mse": selected_outer["mse"],
                 "outer_selected_mae": selected_outer["mae"],
@@ -1771,6 +1909,7 @@ def make_submission(
     out[t_cols] = pred_values
     out[id_col] = pd.to_datetime(out[id_col]).dt.strftime("%Y-%m-%d")
     out = out[[id_col] + t_cols]
+    Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(OUTPUT_PATH, index=False)
 
     print("selected predictor:", predictor["name"])
@@ -1836,16 +1975,35 @@ def run(plot: bool = True, residual_backtest: bool = True) -> dict:
     if plot:
         plot_history(history, final_metric)
 
-    submit = make_submission(selected, model, data["df"], sub, id_col, data, device)
+    submission_model = model
+    submission_data = data
+    refit_history = pd.DataFrame(columns=["phase", "phase_epoch", "train_loss"])
+    if selected["kind"] == "seq_residual_booster":
+        submission_data = make_data_view(
+            data,
+            data["test_start_idx"],
+            midnight_target_indices(data["df"], LOOKBACK, data["test_start_idx"]),
+            data["val_targets"],
+        )
+        submission_model, refit_history = fit_seq_residual_booster_refit(
+            submission_data,
+            best_baseline,
+            device,
+            residual_info["training_plan"],
+            label="SeqResidualFinalRefit",
+        )
+    submit = make_submission(selected, submission_model, submission_data["df"], sub, id_col, submission_data, device)
     return {
-        "model": model,
+        "model": submission_model,
         "history": history,
+        "refit_history": refit_history,
         "baseline": baseline_df,
         "metric": final_metric,
         "predictor": selected,
         "backtest": backtest_df,
         "residual_backtest": residual_backtest_df,
         "residual_lambda": residual_info["lambda_df"],
+        "residual_training_plan": residual_info["training_plan"],
         "submit": submit,
     }
 

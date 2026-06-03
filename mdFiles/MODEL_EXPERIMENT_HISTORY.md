@@ -1196,3 +1196,497 @@ latest validation selected = 5.713983 (LightGBM residual, lambda=1.60)
 validation raw MSE <= 5.50
 ```
 
+---
+
+## 22. 실험 추적 보강
+
+### 22.1 적용한 변경
+
+`run_local_ensemble.py`에 실행별 archive를 추가했다.
+
+새 옵션:
+
+```text
+--experiment-id
+```
+
+옵션을 생략하면 UTC timestamp를 ID로 사용한다.
+
+기존 루트 경로의 최신 결과 CSV는 그대로 생성한다. 동시에 다음 경로에 동일한 산출물을 보관한다.
+
+```text
+csvFiles/experiments/<experiment-id>/
+```
+
+archive에는 제출 후보 CSV, 진단 CSV와 `manifest.json`이 포함된다.
+
+`manifest.json` 기록 항목:
+
+- experiment ID
+- UTC 실행 시각
+- git commit
+- dirty 여부와 dirty file 목록
+- 실행 command
+- thread 수
+- quick / backtest 여부
+- LightGBM / CatBoost 사용 여부
+- CatBoost GPU 여부
+- CatBoost seed 조합
+- residual lambda grid
+- validation 최저 선택 후보와 metric
+- 산출물별 SHA-256 checksum
+- Kaggle 제출 후 연결할 `public_score`
+
+`ensemble_candidates.csv`에도 experiment ID, 선택 여부, git commit, seed 조합, lambda grid, thread 수, GPU 여부를 추가했다.
+
+archive는 재생성 가능한 로컬 실험 산출물이므로 `.gitignore`에 포함했다.
+
+### 22.2 검증
+
+다음 검사는 통과했다.
+
+```text
+python3 -m py_compile run_local_ensemble.py ett_ensemble_pipeline.py ett_forecasting_pytorch.py
+python3 run_local_ensemble.py --help
+archive/checksum helper smoke test
+git diff --check
+```
+
+현재 Linux 작업공간의 Python에는 `pandas`, `lightgbm`, `catboost`가 설치되어 있지 않아 실제 학습 smoke test는 실행하지 못했다.
+
+### 22.3 다음 실행
+
+다음 단계는 CatBoost seed 조합 비교다.
+
+```powershell
+.\.venv\Scripts\python.exe run_local_ensemble.py --threads 10 --experiment-id catboost-seed42 --catboost-seeds 42
+.\.venv\Scripts\python.exe run_local_ensemble.py --threads 10 --experiment-id catboost-seed42-43-44 --catboost-seeds 42,43,44
+.\.venv\Scripts\python.exe run_local_ensemble.py --threads 10 --experiment-id catboost-seed42-2026-777 --catboost-seeds 42,2026,777
+```
+
+비교할 파일:
+
+```text
+csvFiles/experiments/<experiment-id>/manifest.json
+csvFiles/experiments/<experiment-id>/ensemble_candidates.csv
+csvFiles/experiments/<experiment-id>/ensemble_lambda_search.csv
+csvFiles/experiments/<experiment-id>/ensemble_backtest.csv
+```
+
+Kaggle에 후보를 제출한 뒤에는 해당 archive의 `manifest.json`에서 `public_score`를 채워 checksum과 score를 연결한다.
+
+---
+
+## 23. CatBoost seed 조합 비교
+
+Linux `.venv`에서 CPU `10` threads와 full rolling backtest로 비교했다.
+
+| experiment ID | CatBoost seeds | CatBoost validation MSE | lambda | main selected | rolling mean improvement | positive folds |
+| --- | --- | ---: | ---: | --- | ---: | ---: |
+| `catboost-seed42` | `42` | `5.739562` | `1.45` | LightGBM `5.713983` | `-0.007172` | `1/3` |
+| `catboost-seed42-43-44` | `42,43,44` | `5.714991` | `1.60` | LightGBM `5.713983` | `+0.045258` | `1/3` |
+| `catboost-seed42-2026-777` | `42,2026,777` | `5.711936` | `1.60` | CatBoost `5.711936` | `+0.045015` | `1/3` |
+
+판단:
+
+- 새로 추적한 실행 중 main validation 최저 후보는 `catboost-seed42-2026-777`이다.
+- 과거 기록 best CatBoost `5.658024`는 넘지 못했다.
+- rolling positive fold가 `1/3`이므로 lambda 상한을 바로 확장하지 않는다.
+- 과거 `5.658024` artifact가 남아 있다면 checksum과 실행 조건 복원이 우선이다.
+
+---
+
+## 24. Linux 로컬 full 실행 기록
+
+사용자가 Linux `.venv`에서 다음 명령을 실행했다.
+
+```bash
+source .venv/bin/activate
+python run_local_ensemble.py
+```
+
+실험 ID:
+
+```text
+20260602T060036.145221Z
+```
+
+archive:
+
+```text
+csvFiles/experiments/20260602T060036.145221Z/
+```
+
+실행 설정:
+
+```text
+threads = 14
+CatBoost GPU = False
+CatBoost seeds = 42, 1337, 2026
+full rolling backtest = True
+residual lambda grid = 0.50 ~ 1.60, step 0.05
+```
+
+### 24.1 main validation 결과
+
+| 후보 | validation MSE | RMSE | MAE | lambda |
+| --- | ---: | ---: | ---: | ---: |
+| LightGBM residual | `5.713983` | `2.390394` | `1.845855` | `1.60` |
+| CatBoost residual | `5.717802` | `2.391192` | `1.845914` | `1.60` |
+| weighted anchor + residual | `5.787499` | `2.405722` | `1.850264` | - |
+| seasonal anchor | `5.838997` | `2.416402` | `1.855697` | - |
+
+anchor 대비 개선:
+
+| 후보 | MSE 감소 | 감소율 |
+| --- | ---: | ---: |
+| LightGBM residual | `0.125014` | 약 `2.14%` |
+| CatBoost residual | `0.121195` | 약 `2.08%` |
+| weighted anchor + residual | `0.051498` | 약 `0.88%` |
+
+main validation 최저 후보:
+
+```text
+lightgbm_residual
+lambda = 1.60
+validation MSE = 5.713983
+```
+
+### 24.2 rolling backtest 해석
+
+inner validation 최저 단일 후보를 outer 구간에 적용한 결과:
+
+| fold | inner selected | outer baseline MSE | outer selected MSE | improvement |
+| --- | --- | ---: | ---: | ---: |
+| 1 | CatBoost residual | `7.565614` | `7.607316` | `-0.041702` |
+| 2 | CatBoost residual | `7.152225` | `6.719676` | `+0.432549` |
+| 3 | CatBoost residual | `5.916977` | `6.234251` | `-0.317275` |
+
+요약:
+
+```text
+mean improvement = +0.024524
+positive folds = 1/3
+```
+
+같은 실행의 보수적 weighted 후보:
+
+| fold | outer baseline MSE | weighted outer MSE | improvement |
+| --- | ---: | ---: | ---: |
+| 1 | `7.565614` | `7.465306` | `+0.100307` |
+| 2 | `7.152225` | `6.929019` | `+0.223207` |
+| 3 | `5.916977` | `5.837275` | `+0.079702` |
+
+weighted 후보 요약:
+
+```text
+baseline mean MSE = 6.878272
+weighted mean MSE = 6.743867
+mean improvement = +0.134405
+positive folds = 3/3
+```
+
+### 24.3 horizon별 오차
+
+최종 선택된 LightGBM residual의 horizon RMSE:
+
+| segment | RMSE mean | RMSE max | max horizon |
+| --- | ---: | ---: | ---: |
+| 전체 | `2.335765` | `3.152688` | `T89` |
+| `T0-T23` | `1.678976` | `2.367583` | `T14` |
+| `T24-T47` | `2.326862` | `2.788304` | `T41` |
+| `T48-T71` | `2.595883` | `3.000730` | `T64` |
+| `T72-T95` | `2.741337` | `3.152688` | `T89` |
+
+예측 horizon이 멀어질수록 오차가 커진다. 이후 개선에서는 `T48-T95` 장기 구간을 별도로 다루는 feature 또는 block별 모델 적용을 검토할 수 있다.
+
+### 24.4 판단
+
+main validation만 기준으로 하면 `submit_lightgbm_residual.csv`가 1순위다.
+
+하지만 rolling 진단을 함께 보면 결론은 더 신중해야 한다.
+
+1. LightGBM과 CatBoost 단일 residual은 main validation에서 anchor보다 좋다.
+2. inner-selected 단일 residual은 시점 이동에서 `1/3` fold만 개선했다.
+3. weighted 후보는 main validation 개선폭은 작지만 rolling `3/3` fold를 모두 개선했다.
+4. LightGBM과 CatBoost 모두 lambda 상한 `1.60`에서 최저점이므로, main split만 보고 lambda를 즉시 더 키우지 않는다.
+5. 공격형 제출 후보와 안정형 제출 후보를 모두 보관한다.
+
+보관할 제출 파일:
+
+```text
+csvFiles/submit_lightgbm_residual.csv
+csvFiles/submit_weighted_anchor_lgbm_catboost.csv
+```
+
+---
+
+## 25. 직접 예측 멀티모델 기록 분리
+
+`ett_multimodel_kaggle.py`는 seasonal anchor residual 파이프라인과 목적과 평가 흐름이 다르다.
+
+- 이 문서:
+  - `ett_forecasting_pytorch.py`
+  - `ett_ensemble_pipeline.py`
+  - `run_local_ensemble.py`
+  - seasonal anchor + residual 보정 실험
+- 별도 문서:
+  - `ett_multimodel_kaggle.py`
+  - multivariate direct forecast
+  - PatchTST, DLinear, N-BEATS, N-HiTS, Seasonal Naive, LightGBM
+  - fixed / inverse-MSE ensemble
+
+직접 예측 멀티모델의 설계와 실행 결과는 다음 문서에서 이어서 기록한다.
+
+```text
+mdFiles/MULTIMODEL_EXPERIMENT_HISTORY.md
+```
+
+---
+
+## 26. SeqResidualBooster 과거 baseline 오차 feature 추가
+
+### 26.1 개선 근거
+
+기존 `SeqResidualBooster`는 main validation MSE를 `5.645186`까지 낮췄지만 rolling backtest에서 안정적이지 않았다.
+
+tree residual 파이프라인이 안정화된 핵심 중 하나는 현재 시점에 이미 관측이 끝난 과거 baseline 오차를 feature로 추가한 것이다. 같은 정보를 기존 PyTorch booster에도 추가한다.
+
+### 26.2 적용한 변경
+
+과거 target origin lag:
+
+```text
+96
+168
+336
+```
+
+각 lag에서 추가하는 값:
+
+```text
+과거 baseline error curve 96개
+과거 baseline error 요약 통계 7개
+```
+
+누수 방지 조건:
+
+```text
+past_target + HORIZON <= current_target
+```
+
+즉 현재 예측 시점에 이미 실제값이 모두 관측된 과거 예측 오차만 사용한다.
+
+### 26.3 다음 실행
+
+기존 PyTorch Seq residual 경로를 로컬 wrapper로 실행한다.
+
+```bash
+python run_local_pytorch.py
+```
+
+공유할 항목:
+
+```text
+csvFiles/pytorch_run_report.json
+Kaggle에 제출했다면 public MSE
+실행이 실패했다면 마지막 traceback
+```
+
+### 26.4 실행 결과
+
+실험 ID:
+
+```text
+20260602T113842.962248Z
+```
+
+archive:
+
+```text
+csvFiles/pytorch_experiments/20260602T113842.962248Z/
+```
+
+main validation:
+
+| 후보 | MSE | RMSE | MAE | lambda |
+| --- | ---: | ---: | ---: | ---: |
+| seasonal anchor | `5.838997` | `2.416402` | `1.855697` | `0.00` |
+| Seq residual + 과거 오차 feature | `5.289034` | `2.299790` | `1.757868` | `0.30` |
+
+anchor 대비:
+
+```text
+MSE 감소 = 0.549963
+감소율 = 약 9.42%
+```
+
+기존 Seq residual `5.645186` 대비:
+
+```text
+MSE 감소 = 0.356152
+감소율 = 약 6.31%
+```
+
+최적 checkpoint:
+
+```text
+pretrain epoch = 8
+train loss = 0.049927
+lambda = 0.30
+```
+
+finetune에서는 최적값을 갱신하지 못했다.
+
+rolling residual backtest:
+
+| fold | inner baseline MSE | inner residual MSE | lambda | outer baseline MSE | outer residual MSE | improvement |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | `14.115279` | `12.604729` | `0.65` | `7.565614` | `9.589705` | `-2.024092` |
+| 2 | `8.893514` | `8.145619` | `0.20` | `7.152225` | `8.727925` | `-1.575700` |
+| 3 | `8.596092` | `8.564217` | `0.10` | `5.916977` | `6.044295` | `-0.127318` |
+
+요약:
+
+```text
+baseline mean MSE = 6.878272
+residual mean MSE = 8.120642
+mean improvement = -1.242370
+positive folds = 0/3
+```
+
+### 26.5 판단
+
+과거 baseline 오차 feature는 main validation 적합도를 크게 높였다. 그러나 inner validation에서 residual이 좋아 보여도 outer 구간에서는 `3/3` 모두 악화했다.
+
+따라서 이 feature는 예측력이 없는 것이 아니라 시점별 regime에 민감하다. 현재 형태의 단일 lambda residual은 제출 대상으로 사용하지 않는다.
+
+backtest gate가 정상적으로 seasonal anchor로 fallback했다.
+
+```text
+csvFiles/submit_seq_residual.csv
+sha256 = 1a7740d3b05e93e49a006e055ca1326826e1ebda5c39284c3877d5f301c74ee4
+```
+
+이 checksum은 `csvFiles/submit_anchor.csv`와 동일하다.
+
+---
+
+## 27. SeqResidualBooster 선택 후 full-label refit
+
+### 27.1 개선 근거
+
+기존 rolling backtest는 inner validation으로 checkpoint와 lambda를 선택한 뒤 outer 구간을 예측했다. 하지만 outer 시작 직전까지 실제값이 확인된 inner validation label은 모델 재학습에 사용하지 않았다.
+
+최종 제출 경로도 동일하게 validation label을 버린 상태로 `2018-02-01` 이후를 예측했다.
+
+### 27.2 적용한 변경
+
+선택 단계:
+
+```text
+train 구간으로 학습
+validation 구간으로 checkpoint, epoch 계획, lambda 선택
+```
+
+refit 단계:
+
+```text
+선택된 pretrain / finetune epoch 수를 고정
+예측 시작 직전까지 관측 완료된 label을 포함해 새 모델 학습
+lambda는 validation에서 고정
+```
+
+rolling outer refit:
+
+```text
+target end < outer_start
+scaler fit end = outer_start
+```
+
+최종 제출 refit:
+
+```text
+target end < 2018-02-01 00:00:00
+scaler fit end = 2018-02-01 00:00:00
+```
+
+test 미래 label은 사용하지 않는다.
+
+### 27.3 추가 진단
+
+rolling CSV에 다음 컬럼을 추가한다.
+
+```text
+refit_pretrain_epochs
+refit_finetune_epochs
+outer_validation_stage_residual_mse
+outer_residual_mse
+```
+
+`outer_validation_stage_residual_mse`와 `outer_residual_mse`를 비교하면 최신 허용 label refit이 실제로 시점 이동 성능을 개선했는지 확인할 수 있다.
+
+다음 실행:
+
+```bash
+python run_local_pytorch.py
+```
+
+### 27.4 실행 결과
+
+최신 실험 ID:
+
+```text
+20260602T121332.836108Z
+```
+
+선택 단계 main validation은 이전 실행과 동일하다.
+
+```text
+seasonal anchor MSE = 5.838997
+Seq residual MSE = 5.289034
+lambda = 0.30
+selected training plan = pretrain 8 epochs, finetune 0 epochs
+```
+
+rolling refit 결과:
+
+| fold | lambda | refit pretrain epoch | outer baseline MSE | refit 전 residual MSE | refit 후 residual MSE | refit 효과 | baseline 대비 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | `0.65` | `2` | `7.565614` | `9.589705` | `11.719132` | `-2.129427` | `-4.153519` |
+| 2 | `0.15` | `19` | `7.152225` | `8.082755` | `7.517614` | `+0.565141` | `-0.365389` |
+| 3 | `0.10` | `1` | `5.916977` | `5.988655` | `5.884614` | `+0.104040` | `+0.032362` |
+
+요약:
+
+```text
+baseline mean MSE = 6.878272
+refit 전 residual mean MSE = 7.887038
+refit 후 residual mean MSE = 8.373787
+refit 후 baseline 대비 mean improvement = -1.495515
+positive folds = 1/3
+```
+
+### 27.5 판단
+
+full-label refit은 fold `2`, `3`에서는 residual MSE를 낮췄다. 하지만 fold `1`에서 크게 악화하여 전체 안정성을 개선하지 못했다.
+
+따라서 최신 허용 label을 추가하는 것만으로 regime 민감성을 해결할 수 없다. 선택된 epoch 계획이 fold별로 `2`, `19`, `1`처럼 크게 흔들리는 점도 확인됐다.
+
+backtest gate가 다시 seasonal anchor로 fallback했다.
+
+```text
+csvFiles/submit_seq_residual.csv
+sha256 = 1a7740d3b05e93e49a006e055ca1326826e1ebda5c39284c3877d5f301c74ee4
+```
+
+이 checksum은 `csvFiles/submit_anchor.csv`와 동일하다.
+
+참고:
+
+```text
+20260602T115059.755053Z
+20260602T121332.836108Z
+```
+
+두 refit 실행 결과는 동일하다. GPU 실행에서도 재현성이 유지됐다.

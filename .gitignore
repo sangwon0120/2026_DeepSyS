@@ -1,14 +1,23 @@
 __pycache__/
 *.pyc
+.venv/
 .matplotlib_cache/
 
 best_model.pt
 best_residual_mlp.pt
+best_seq_residual_booster.pt
+best_patchtst_residual.pt
 model_best_mlp.npz
 
 submit.csv
 submit_*.csv
 ensemble_*.csv
+experiments/
+run_report*.json
 training_history.csv
 validation_summary.csv
 
+csvFiles/*
+!csvFiles/sample_submit.csv
+
+multimodel_output/*

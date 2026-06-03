@@ -10,7 +10,7 @@ import pandas as pd
 import ett_forecasting_pytorch as base
 
 
-OUTPUT_PATH = "submit_ensemble.csv"
+OUTPUT_PATH = "csvFiles/submit_ensemble.csv"
 WEIGHTED_ENSEMBLE_NAME = "weighted_anchor_lgbm_catboost"
 ENSEMBLE_LOOKBACK = 672
 ENSEMBLE_START_LOOKBACK = ENSEMBLE_LOOKBACK + base.LOOKBACK
@@ -915,6 +915,8 @@ def make_submission(
     id_col: str,
     output_path: str | Path = OUTPUT_PATH,
 ) -> pd.DataFrame:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     target_indices = submission_target_indices(data["df"], sub, id_col, selected)
     raw_ot = data["df"][base.TARGET_COL].values.astype("float32")
 
@@ -961,6 +963,7 @@ def write_candidate_submissions(
     output_dir: str | Path,
 ) -> dict[str, Path]:
     output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     target_indices = submission_target_indices(
         data["df"],
         sub,

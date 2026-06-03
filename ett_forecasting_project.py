@@ -965,8 +965,8 @@ def optimize_and_submit(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train ETTh1 96-hour OT forecaster and create submit.csv")
     parser.add_argument("--data-path", type=Path, default=Path("ETTh1.csv"))
-    parser.add_argument("--sample-path", type=Path, default=Path("sample_submit.csv"))
-    parser.add_argument("--output-dir", type=Path, default=Path("."))
+    parser.add_argument("--sample-path", type=Path, default=Path("csvFiles/sample_submit.csv"))
+    parser.add_argument("--output-dir", type=Path, default=Path("csvFiles"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-fraction-before-test", type=float, default=0.75)
     parser.add_argument("--full", action="store_true", help="Run a larger experiment grid.")
